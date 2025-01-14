@@ -156,12 +156,83 @@ server_tcp (uint16_t listen_port, const char *file)
   return 0;
 }
 
-int
-server_microtcp (uint16_t listen_port, const char *file)
-{
-  /*TODO: Write your code here */
-  return 0;
+int 
+server_microtcp(uint16_t listen_port, const char *file) {
+    uint8_t *buffer;
+    FILE *fp;
+    ssize_t received;
+    ssize_t written;
+    ssize_t total_bytes = 0;
+    struct timespec start_time, end_time;
+
+    printf("Initializing microTCP server...\n");
+
+    /* Initialize microTCP socket */
+    microtcp_sock_t server_socket = microtcp_socket(AF_INET, SOCK_DGRAM, 0);
+    if (server_socket.state == INVALID) {
+        fprintf(stderr, "Failed to create microTCP socket\n");
+        return -EXIT_FAILURE;
+    }
+
+    struct sockaddr_in server_addr = {0};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(listen_port);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+
+    printf("Binding microTCP socket to port %d...\n", listen_port);
+    if (microtcp_bind(&server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        fprintf(stderr, "microTCP bind failed\n");
+        return -EXIT_FAILURE;
+    }
+
+    printf("Waiting for client connection...\n");
+    if (microtcp_accept(&server_socket, NULL, 0) < 0) {
+        fprintf(stderr, "microTCP accept failed\n");
+        return -EXIT_FAILURE;
+    }
+
+    printf("Client connected successfully.\n");
+
+    /* Allocate memory for the application receive buffer */
+    buffer = (uint8_t *)malloc(CHUNK_SIZE);
+    if (!buffer) {
+        perror("Allocate application receive buffer");
+        return -EXIT_FAILURE;
+    }
+
+    /* Open the file for writing the data from the network */
+    fp = fopen(file, "w");
+    if (!fp) {
+        perror("Open file for writing");
+        free(buffer);
+        return -EXIT_FAILURE;
+    }
+
+    /* Start processing the received data */
+    printf("Receiving data...\n");
+    clock_gettime(CLOCK_MONOTONIC_RAW, &start_time);
+    while ((received = microtcp_recv(&server_socket, buffer, CHUNK_SIZE, 0)) > 0) {
+        printf("Received %ld bytes\n", received);
+        written = fwrite(buffer, sizeof(uint8_t), received, fp);
+        total_bytes += received;
+        if (written * sizeof(uint8_t) != received) {
+            fprintf(stderr, "Failed to write received data to file\n");
+            free(buffer);
+            fclose(fp);
+            return -EXIT_FAILURE;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC_RAW, &end_time);
+    print_statistics(total_bytes, start_time, end_time);
+
+    printf("Reception completed. Total bytes received: %ld\n", total_bytes);
+
+    free(buffer);
+    fclose(fp);
+    microtcp_shutdown(&server_socket, SHUT_RDWR);
+    return 0;
 }
+     
 
 int
 client_tcp (const char *serverip, uint16_t server_port, const char *file)
@@ -245,11 +316,76 @@ client_tcp (const char *serverip, uint16_t server_port, const char *file)
   return 0;
 }
 
-int
-client_microtcp (const char *serverip, uint16_t server_port, const char *file)
-{
-  /*TODO: Write your code here */
-  return 0;
+int 
+client_microtcp(const char *serverip, uint16_t server_port, const char *file) {
+    uint8_t *buffer;
+    FILE *fp;
+    ssize_t read_items;
+    ssize_t data_sent;
+
+    printf("Initializing microTCP client...\n");
+
+    /* Initialize microTCP socket */
+    microtcp_sock_t client_socket = microtcp_socket(AF_INET, SOCK_DGRAM, 0);
+    if (client_socket.state == INVALID) {
+        fprintf(stderr, "Failed to create microTCP socket\n");
+        return -EXIT_FAILURE;
+    }
+
+    struct sockaddr_in server_addr = {0};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(server_port);
+    inet_pton(AF_INET, serverip, &server_addr.sin_addr);
+
+    printf("Connecting to server at %s:%d...\n", serverip, server_port);
+    if (microtcp_connect(&client_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        fprintf(stderr, "microTCP connect failed\n");
+        return -EXIT_FAILURE;
+    }
+
+    /* Allocate memory for the application send buffer */
+    buffer = (uint8_t *)malloc(CHUNK_SIZE);
+    if (!buffer) {
+        perror("Allocate application send buffer");
+        return -EXIT_FAILURE;
+    }
+
+    /* Open the file for reading the data to send */
+    fp = fopen(file, "r");
+    if (!fp) {
+        perror("Open file for reading");
+        free(buffer);
+        return -EXIT_FAILURE;
+    }
+
+    printf("Starting to send data...\n");
+    while (!feof(fp)) {
+        read_items = fread(buffer, sizeof(uint8_t), CHUNK_SIZE, fp);
+        if (read_items < 1 && !feof(fp)) {
+            fprintf(stderr, "Failed to read from file\n");
+            free(buffer);
+            fclose(fp);
+            return -EXIT_FAILURE;
+        }
+
+        printf("Read %ld bytes from file\n", read_items);
+
+        data_sent = microtcp_send(&client_socket, buffer, read_items * sizeof(uint8_t), 0);
+        if (data_sent < 0) {
+            fprintf(stderr, "Failed to send data\n");
+            free(buffer);
+            fclose(fp);
+            return -EXIT_FAILURE;
+        }
+
+        printf("Sent %ld bytes to server\n", data_sent);
+    }
+
+    printf("Data sent. Terminating connection...\n");
+    free(buffer);
+    fclose(fp);
+    microtcp_shutdown(&client_socket, SHUT_RDWR);
+    return 0;
 }
 
 int
