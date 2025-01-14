@@ -335,7 +335,10 @@ client_microtcp(const char *serverip, uint16_t server_port, const char *file) {
     struct sockaddr_in server_addr = {0};
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(server_port);
-    inet_pton(AF_INET, serverip, &server_addr.sin_addr);
+    if (inet_pton(AF_INET, serverip, &server_addr.sin_addr) <= 0) {
+        fprintf(stderr, "Invalid server IP address\n");
+        return -EXIT_FAILURE;
+    }
 
     printf("Connecting to server at %s:%d...\n", serverip, server_port);
     if (microtcp_connect(&client_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
@@ -350,6 +353,7 @@ client_microtcp(const char *serverip, uint16_t server_port, const char *file) {
         return -EXIT_FAILURE;
     }
 
+    printf("Opening file: %s\n", file);
     /* Open the file for reading the data to send */
     fp = fopen(file, "r");
     if (!fp) {
