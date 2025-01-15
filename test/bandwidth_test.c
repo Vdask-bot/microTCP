@@ -222,6 +222,12 @@ server_microtcp(uint16_t listen_port, const char *file) {
             return -EXIT_FAILURE;
         }
     }
+
+    if (received == 0) {
+      printf("FIN received. Closing connection.\n");
+      printf("Socket state before shutdown: %d\n", server_socket.state);
+    }
+
     clock_gettime(CLOCK_MONOTONIC_RAW, &end_time);
     print_statistics(total_bytes, start_time, end_time);
 
@@ -229,10 +235,17 @@ server_microtcp(uint16_t listen_port, const char *file) {
 
     free(buffer);
     fclose(fp);
-    microtcp_shutdown(&server_socket, SHUT_RDWR);
+
+    /* Shutdown the connection gracefully */
+    printf("Shutting down the microTCP connection...\n");
+    if (microtcp_shutdown(&server_socket, SHUT_RDWR) < 0) {
+      fprintf(stderr, "Failed to shutdown microTCP connection. Socket state: %d\n", server_socket.state);
+      return -EXIT_FAILURE;
+    }
+
+    printf("Connection terminated successfully.\n");
     return 0;
-}
-     
+}    
 
 int
 client_tcp (const char *serverip, uint16_t server_port, const char *file)
