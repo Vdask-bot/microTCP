@@ -473,129 +473,103 @@ int microtcp_shutdown(microtcp_sock_t *socket, int how) {
     return -1;
 }
 
-ssize_t microtcp_send(microtcp_sock_t *socket, const void *buffer, size_t length, int flags) {
-    if (!socket || (socket->state != ESTABLISHED && socket->state != CLOSED && socket->state != LISTEN)) {
-        fprintf(stderr, "microtcp_send: Socket not in a valid state\n");
-        return -1;
-    }
+ssize_t microtcp_send(microtcp_socket *sock, const void *buf, size_t len) {
+    size_t total_sent = 0;
+    size_t chunk_size;
+    size_t cwnd = sock->cwnd;  // Congestion window size (initial value)
+    size_t ssthresh = sock->ssthresh;  // Slow start threshold
+    size_t current_seq_number = sock->seq_number;
+    size_t last_sent_seq_number = current_seq_number;
+    size_t ack_number = 0;  // Initialize ACK number
+    size_t duplicate_ack_count = 0;  // Counter for duplicate ACKs
 
-    if (!buffer || length == 0) {
-        fprintf(stderr, "microtcp_send: Invalid buffer or length\n");
-        return -1;
-    }
+    // Send data until all of it is sent
+    while (total_sent < len) {
+        chunk_size = (len - total_sent > cwnd) ? cwnd : (len - total_sent);  // Send data based on congestion window
 
-    size_t bytes_sent = 0;
-    struct sockaddr_in peer_addr;
-    socklen_t peer_addr_len = sizeof(peer_addr);
+        // Simulate sending the chunk
+        ssize_t sent = socket_send(sock->fd, (char*)buf + total_sent, chunk_size);  // Use your socket send function
 
-    printf("microtcp_send: Starting data transmission\n");
-
-    while (bytes_sent < length) {
-        size_t segment_size = (length - bytes_sent > MICROTCP_MSS) ? MICROTCP_MSS : length - bytes_sent;
-        microtcp_header_t data_packet = {0};
-        data_packet.control = 0x00; // Data flag
-        data_packet.seq_number = htonl(socket->seq_number);
-        data_packet.ack_number = htonl(socket->ack_number);
-        data_packet.data_len = htonl(segment_size);
-
-        uint8_t sendbuf[MICROTCP_MSS + sizeof(microtcp_header_t)];
-        memcpy(sendbuf, &data_packet, sizeof(data_packet));
-        memcpy(sendbuf + sizeof(data_packet), (uint8_t *)buffer + bytes_sent, segment_size);
-        data_packet.checksum = 0; // Reset checksum before computation
-        data_packet.checksum = htonl(crc32(sendbuf, sizeof(data_packet) + segment_size));
-        memcpy(sendbuf, &data_packet, sizeof(data_packet));
-
-        if (getpeername(socket->sd, (struct sockaddr *)&peer_addr, &peer_addr_len) < 0) {
-            perror("microtcp_send: Failed to get peer address");
+        if (sent < 0) {
+            // Handle send error (e.g., congestion or timeout)
             return -1;
         }
 
-        if (sendto(socket->sd, sendbuf, sizeof(data_packet) + segment_size, flags,
-                   (struct sockaddr *)&peer_addr, peer_addr_len) < 0) {
-            perror("microtcp_send: Failed to send data packet");
-            return -1;
+        total_sent += sent;
+        current_seq_number += sent;
+        last_sent_seq_number = current_seq_number;  // Update last sent sequence number
+
+        // Wait for ACK (simulate waiting for ACK here)
+        bool ack_received = wait_for_ack(sock, &ack_number);  // Placeholder for actual ACK waiting mechanism
+
+        if (ack_received) {
+            // Check for duplicate ACKs
+            if (ack_number == last_sent_seq_number) {
+                duplicate_ack_count++;
+                if (duplicate_ack_count >= 3) {
+                    // If we get 3 duplicate ACKs, retransmit the last packet
+                    printf("Duplicate ACK detected, retransmitting packet...\n");
+                    socket_send(sock->fd, (char*)buf + total_sent - chunk_size, chunk_size);  // Retransmit last chunk
+                    duplicate_ack_count = 0;  // Reset duplicate ACK count after retransmission
+                }
+            } else {
+                duplicate_ack_count = 0;  // Reset if we receive a new ACK
+
+                // In slow start, increase the congestion window additively
+                if (cwnd < ssthresh) {
+                    cwnd += 1;
+                } else {
+                    // In congestion avoidance, increase the congestion window additively
+                    cwnd += cwnd / 10;
+                }
+            }
+        } else {
+            // Timeout occurred, retransmit the last packet
+            printf("Timeout occurred, retransmitting last packet...\n");
+            socket_send(sock->fd, (char*)buf + total_sent - chunk_size, chunk_size);  // Retransmit last chunk
         }
 
-        printf("Sent %zu bytes, seq_number: %u\n", segment_size, ntohl(data_packet.seq_number));
-        bytes_sent += segment_size;
-        socket->seq_number += segment_size;
+        // Log window size for debugging
+        printf("Current congestion window (cwnd): %zu\n", cwnd);
     }
 
-    printf("microtcp_send: Transmission complete. Total bytes sent: %zu\n", bytes_sent);
-
-    return bytes_sent;
+    // Return the total number of bytes sent
+    return total_sent;
 }
 
-ssize_t microtcp_recv(microtcp_sock_t *socket, void *buffer, size_t length, int flags) {
-    printf("microtcp_recv: Socket state before recv: %d\n", socket->state);
 
-    if (!socket || (socket->state != ESTABLISHED && socket->state != LISTEN && socket->state != CLOSED)) {
-        fprintf(stderr, "microtcp_recv: Socket not in a valid state for receiving packets\n");
-        return -1;
+ssize_t microtcp_recv(microtcp_sock_t *sock, void *buffer, size_t length) {
+    ssize_t received_bytes = 0;
+    microtcp_packet_t packet;
+
+    while (received_bytes < length) {
+        // Wait for incoming data
+        packet = receive_packet(sock);
+
+        // If we received a FIN packet, handle connection termination
+        if (packet.flags & FIN_FLAG) {
+            send_ack(sock, packet.seq_number + 1);
+            break;  // Stop receiving data
+        }
+
+        // Extract data from the received packet and add it to the buffer
+        size_t data_size = extract_data(packet, buffer + received_bytes, length - received_bytes);
+        received_bytes += data_size;
+
+        // **Flow control**: After receiving, check and update the receive window
+        sock->recv_window -= data_size;
+
+        // Acknowledge the received packet
+        send_ack(sock, packet.seq_number + data_size);
+
+        // **Flow control**: Wait if the receive window is full
+        while (sock->recv_window == 0) {
+            wait_for_application_to_consume_data();
+            sock->recv_window = get_available_buffer_space();  // Update window size
+        }
     }
 
-    if (!buffer || length == 0) {
-        fprintf(stderr, "microtcp_recv: Invalid buffer or length\n");
-        return -1;
-    }
-
-    printf("microtcp_recv: Waiting to receive data...\n");
-
-    uint8_t recvbuf[MICROTCP_MSS + sizeof(microtcp_header_t)];
-    struct sockaddr_in peer_addr;
-    socklen_t peer_addr_len = sizeof(peer_addr);
-
-    ssize_t received = recvfrom(socket->sd, recvbuf, sizeof(recvbuf), flags,
-                                (struct sockaddr *)&peer_addr, &peer_addr_len);
-    if (received < (ssize_t)sizeof(microtcp_header_t)) {
-        fprintf(stderr, "microtcp_recv: Received invalid packet\n");
-        return -1;
-    }
-
-    printf("microtcp_recv: Packet received, size: %ld bytes\n", received);
-
-    microtcp_header_t *header = (microtcp_header_t *)recvbuf;
-    uint32_t received_checksum = ntohl(header->checksum);
-    header->checksum = 0;
-
-    if (crc32(recvbuf, received) != received_checksum) {
-        fprintf(stderr, "microtcp_recv: Checksum validation failed\n");
-        return -1;
-    }
-
-    if (header->control & 0x01) { // FIN flag
-        printf("microtcp_recv: FIN packet received\n");
-        socket->state = CLOSING_BY_PEER;
-        return 0; // Indicate that FIN was received
-    }
-
-    size_t data_length = received - sizeof(microtcp_header_t);
-    if (data_length > length) {
-        fprintf(stderr, "microtcp_recv: Buffer too small for received data\n");
-        return -1;
-    }
-
-    memcpy(buffer, recvbuf + sizeof(microtcp_header_t), data_length);
-    socket->ack_number += data_length;
-
-    printf("microtcp_recv: Data extracted, length: %zu bytes\n", data_length);
-
-    microtcp_header_t ack_packet = {0};
-    ack_packet.control = 0x10; // ACK flag
-    ack_packet.seq_number = htonl(socket->seq_number);
-    ack_packet.ack_number = htonl(socket->ack_number);
-    ack_packet.window = htonl(MICROTCP_RECVBUF_LEN - socket->buf_fill_level);
-    ack_packet.checksum = 0;
-    ack_packet.checksum = htonl(crc32((uint8_t *)&ack_packet, sizeof(ack_packet)));
-
-    if (sendto(socket->sd, &ack_packet, sizeof(ack_packet), 0, (struct sockaddr *)&peer_addr, peer_addr_len) < 0) {
-        perror("microtcp_recv: Failed to send ACK");
-        return -1;
-    }
-
-    printf("microtcp_recv: ACK sent, ack_number: %u\n", ntohl(ack_packet.ack_number));
-
-    return data_length;
+    return received_bytes;
 }
 
 
