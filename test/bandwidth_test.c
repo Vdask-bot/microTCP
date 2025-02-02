@@ -376,25 +376,21 @@ client_microtcp(const char *serverip, uint16_t server_port, const char *file) {
     }
 
     printf("Starting to send data...\n");
-    while (!feof(fp)) {
-        read_items = fread(buffer, sizeof(uint8_t), CHUNK_SIZE, fp);
-        if (read_items < 1 && !feof(fp)) {
-            fprintf(stderr, "Failed to read from file\n");
-            free(buffer);
-            fclose(fp);
-            return -EXIT_FAILURE;
-        }
+    while (1) {
+        /* Διαβάζουμε δεδομένα 1 byte τη φορά ώστε να πάρουμε ακριβώς τον αριθμό των bytes */
+        read_items = fread(buffer, 1, CHUNK_SIZE, fp);
+        if (read_items == 0)
+            break;  /* EOF */
 
         printf("Read %ld bytes from file\n", read_items);
 
-        data_sent = microtcp_send(&client_socket, buffer, read_items * sizeof(uint8_t), 0);
+        data_sent = microtcp_send(&client_socket, buffer, read_items, 0);
         if (data_sent < 0) {
             fprintf(stderr, "Failed to send data\n");
             free(buffer);
             fclose(fp);
             return -EXIT_FAILURE;
         }
-
         printf("Sent %ld bytes to server\n", data_sent);
     }
 
