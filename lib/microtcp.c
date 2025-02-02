@@ -449,6 +449,7 @@ int microtcp_shutdown(microtcp_sock_t *socket, int how)
 }
 
 /* -------------------- microtcp_send -------------------- */
+/* -------------------- microtcp_send -------------------- */
 ssize_t microtcp_send(microtcp_sock_t *socket, const void *buffer, size_t length, int flags)
 {
   if (!socket || (socket->state != ESTABLISHED && socket->state != CLOSED && socket->state != LISTEN))
@@ -467,15 +468,42 @@ ssize_t microtcp_send(microtcp_sock_t *socket, const void *buffer, size_t length
 
   while (bytes_sent < length)
   {
-    size_t segment_size = (length - bytes_sent > MICROTCP_MSS) ? MICROTCP_MSS : length - bytes_sent;
+    /* Υπολογισμός effective window = min(cwnd, curr_win_size) */
+    size_t effective_window = (socket->cwnd < socket->curr_win_size) ? socket->cwnd : socket->curr_win_size;
 
-    /* Flow control: ελέγχει αν το cwnd επιτρέπει την αποστολή του segment */
-    if (socket->cwnd < segment_size)
-    {
-      usleep(1000); // περιμένουμε 1ms πριν ξαναδοκιμάσουμε
-      continue;
+    /* Αν το effective window είναι 0, στέλνουμε probe πακέτο μέχρι να έχουμε διαθέσιμο χώρο */
+    if (effective_window == 0) {
+      unsigned int wait_time = rand() % MICROTCP_ACK_TIMEOUT_US;
+      usleep(wait_time);
+      /* Probe packet χωρίς payload (data_len = 0) */
+      microtcp_header_t probe_packet = {0};
+      probe_packet.control = 0x00; // Data flag
+      probe_packet.seq_number = htonl(socket->seq_number);
+      probe_packet.ack_number = htonl(socket->ack_number);
+      probe_packet.data_len = htonl(0);
+      probe_packet.checksum = 0;
+      probe_packet.checksum = htonl(crc32((uint8_t *)&probe_packet, sizeof(probe_packet)));
+      if (sendto(socket->sd, &probe_packet, sizeof(probe_packet), flags, NULL, 0) < 0) {
+        perror("microtcp_send: Failed to send probe packet");
+        return -1;
+      }
+      /* Προσπαθούμε να λάβουμε ACK για να ενημερωθεί το curr_win_size */
+      microtcp_header_t ack_probe;
+      ssize_t ack_received = recvfrom(socket->sd, &ack_probe, sizeof(ack_probe), 0, NULL, NULL);
+      if (ack_received >= 0) {
+        uint16_t remote_win = ntohs(ack_probe.window);
+        socket->curr_win_size = remote_win;
+      }
+      continue; /* Επαναλαμβάνουμε για να επανυπολογίσουμε το effective_window */
     }
 
+    /* Εάν το segment_size που θέλουμε να στείλουμε υπερβαίνει το effective window, το μειώνουμε */
+    size_t segment_size = (length - bytes_sent > MICROTCP_MSS) ? MICROTCP_MSS : length - bytes_sent;
+    if (segment_size > effective_window) {
+      segment_size = effective_window;
+    }
+
+    /* Δημιουργία του data packet */
     microtcp_header_t data_packet = {0};
     data_packet.control = 0x00; // Data flag
     data_packet.seq_number = htonl(socket->seq_number);
@@ -489,7 +517,7 @@ ssize_t microtcp_send(microtcp_sock_t *socket, const void *buffer, size_t length
     data_packet.checksum = htonl(crc32(sendbuf, sizeof(data_packet) + segment_size));
     memcpy(sendbuf, &data_packet, sizeof(data_packet));
 
-    /* Αποθήκευση του τελευταίου σταλθέντος πακέτου για πιθανή επαν-αποστολή */
+    /* Αποθήκευση του τελευταίου σταλθέντος πακέτου για retransmission */
     if (socket->last_sent_segment)
       free(socket->last_sent_segment);
     socket->last_sent_segment = malloc(sizeof(sendbuf));
@@ -497,8 +525,7 @@ ssize_t microtcp_send(microtcp_sock_t *socket, const void *buffer, size_t length
     socket->last_sent_length = sizeof(data_packet) + segment_size;
 
     /* Αποστολή του πακέτου */
-    if (sendto(socket->sd, sendbuf, sizeof(data_packet) + segment_size, flags, NULL, 0) < 0)
-    {
+    if (sendto(socket->sd, sendbuf, sizeof(data_packet) + segment_size, flags, NULL, 0) < 0) {
       perror("microtcp_send: Failed to send data packet");
       return -1;
     }
@@ -510,43 +537,38 @@ ssize_t microtcp_send(microtcp_sock_t *socket, const void *buffer, size_t length
     struct timeval timeout;
     timeout.tv_sec = 0;
     timeout.tv_usec = MICROTCP_ACK_TIMEOUT_US;
-    if (setsockopt(socket->sd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0)
-    {
+    if (setsockopt(socket->sd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
       perror("setsockopt");
     }
 
     /* Αναμονή για ACK */
     microtcp_header_t ack_packet;
     ssize_t ack_received = recvfrom(socket->sd, &ack_packet, sizeof(ack_packet), 0, NULL, NULL);
-    if (ack_received < 0)
-    {
-      // Timeout ή λάθος: επανεκπομπή του τελευταίου πακέτου
+    if (ack_received < 0) {
       printf("Timeout occurred, retransmitting\n");
       sendto(socket->sd, socket->last_sent_segment, socket->last_sent_length, flags, NULL, 0);
       socket->ssthresh = socket->cwnd / 2;
       socket->cwnd = (MICROTCP_MSS < socket->ssthresh) ? MICROTCP_MSS : socket->ssthresh;
       continue;
-    }
-    else
-    {
+    } else {
+      /* Ενημέρωση του receiver window από το πεδίο window του ACK */
+      uint16_t remote_win = ntohs(ack_packet.window);
+      socket->curr_win_size = remote_win;
+
       uint32_t received_ack = ntohl(ack_packet.ack_number);
       uint32_t ack_recv_checksum = ntohl(ack_packet.checksum);
       ack_packet.checksum = 0;
       uint32_t calc_ack_checksum = crc32((uint8_t *)&ack_packet, sizeof(ack_packet));
-      if (calc_ack_checksum != ack_recv_checksum || !(ack_packet.control & 0x10))
-      {
+      if (calc_ack_checksum != ack_recv_checksum || !(ack_packet.control & 0x10)) {
         fprintf(stderr, "Invalid ACK received\n");
         continue;
       }
 
       /* Έλεγχος για duplicate ACK */
-      if (received_ack == socket->last_acked_seq)
-      {
+      if (received_ack == socket->last_acked_seq) {
         socket->dup_ack_count++;
         printf("Duplicate ACK received: %u (count=%d)\n", received_ack, socket->dup_ack_count);
-        if (socket->dup_ack_count == 3)
-        {
-          // Fast retransmit: επανέστρεψε το τελευταίο πακέτο
+        if (socket->dup_ack_count == 3) {
           printf("Fast retransmit triggered, resending last packet\n");
           sendto(socket->sd, socket->last_sent_segment, socket->last_sent_length, flags, NULL, 0);
           socket->ssthresh = socket->cwnd / 2;
@@ -554,26 +576,15 @@ ssize_t microtcp_send(microtcp_sock_t *socket, const void *buffer, size_t length
           socket->dup_ack_count = 0;
           continue;
         }
-      }
-      else if (received_ack > socket->last_acked_seq)
-      {
-        // Νέο ACK
+      } else if (received_ack > socket->last_acked_seq) {
         socket->dup_ack_count = 0;
         socket->last_acked_seq = received_ack;
-
         /* Ενημέρωση του congestion window */
-        if (socket->cwnd <= socket->ssthresh)
-        {
-          // Slow start: αύξηση cwnd κατά MICROTCP_MSS
+        if (socket->cwnd <= socket->ssthresh) {
           socket->cwnd += MICROTCP_MSS;
-        }
-        else
-        {
-          // Congestion avoidance: αύξηση cwnd περίπου κατά (MSS^2 / cwnd)
+        } else {
           socket->cwnd += (MICROTCP_MSS * MICROTCP_MSS) / socket->cwnd;
         }
-
-        /* Ενημέρωση του sequence number και των στατιστικών */
         socket->seq_number += segment_size;
         bytes_sent += segment_size;
       }
