@@ -2,20 +2,7 @@
  * microtcp, a lightweight implementation of TCP for teaching,
  * and academic purposes.
  *
- * Copyright (C) 2015-2017  Manolis Surligas <surligas@gmail.com>
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * See microtcp.h for details.
  */
 
 #include <stdio.h>
@@ -27,15 +14,18 @@
 #include <stddef.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 #include "microtcp.h"
 #include "../utils/crc32.h"
 
-microtcp_sock_t
-microtcp_socket(int domain, int type, int protocol)
+/* -------------------- microtcp_socket -------------------- */
+microtcp_sock_t microtcp_socket(int domain, int type, int protocol)
 {
   microtcp_sock_t sock;
 
-  // Create the UDP socket
+  // Create the underlying UDP socket
   sock.sd = socket(domain, type, protocol);
   if (sock.sd < 0)
   {
@@ -54,11 +44,10 @@ microtcp_socket(int domain, int type, int protocol)
   if (!sock.recvbuf)
   {
     perror("Failed to allocate memory for receive buffer");
-    close(sock.sd); // Clean up socket if buffer allocation fails
+    close(sock.sd);
     sock.state = INVALID;
     return sock;
   }
-
   sock.buf_fill_level = 0;
 
   // Congestion control variables
@@ -68,17 +57,26 @@ microtcp_socket(int domain, int type, int protocol)
   sock.seq_number = 0;
   sock.ack_number = 0;
 
-  // Initialize statistics
+  // Initialize additional fields for sequence and retransmission handling
+  sock.expected_seq = 0;
+  sock.last_acked_seq = 0;
+  sock.dup_ack_count = 0;
+  sock.last_sent_segment = NULL;
+  sock.last_sent_length = 0;
+
+  // Statistics
   sock.packets_send = 0;
   sock.packets_received = 0;
   sock.packets_lost = 0;
   sock.bytes_send = 0;
   sock.bytes_received = 0;
   sock.bytes_lost = 0;
+
   printf("Socket created with state: %d\n", sock.state);
   return sock;
 }
 
+/* -------------------- microtcp_bind -------------------- */
 int microtcp_bind(microtcp_sock_t *socket, const struct sockaddr *address,
                   socklen_t address_len)
 {
@@ -88,126 +86,129 @@ int microtcp_bind(microtcp_sock_t *socket, const struct sockaddr *address,
     return -1;
   }
 
-  // Attempt to bind the underlying UDP socket
   if (bind(socket->sd, address, address_len) < 0)
   {
     perror("bind");
     return -1;
   }
 
-  // If binding is successful, update the state if necessary
   socket->state = LISTEN;
   return 0;
 }
 
-int 
-microtcp_connect(microtcp_sock_t *socket, const struct sockaddr *address, socklen_t address_len) {
-    printf("microtcp_connect: Starting connection process...\n");
+/* -------------------- microtcp_connect -------------------- */
+int microtcp_connect(microtcp_sock_t *socket, const struct sockaddr *address,
+                     socklen_t address_len)
+{
+  printf("microtcp_connect: Starting connection process...\n");
 
-    if (!socket || socket->state == INVALID) {
-        fprintf(stderr, "microtcp_connect: Invalid microTCP socket\n");
-        return -1;
-    }
+  if (!socket || socket->state == INVALID)
+  {
+    fprintf(stderr, "microtcp_connect: Invalid microTCP socket\n");
+    return -1;
+  }
 
-    printf("microtcp_connect: Initial socket state: %d\n", socket->state);
+  printf("microtcp_connect: Initial socket state: %d\n", socket->state);
 
-    // Prepare and send a SYN packet
-    microtcp_header_t syn_packet;
-    memset(&syn_packet, 0, sizeof(syn_packet));
+  // Prepare and send a SYN packet
+  microtcp_header_t syn_packet;
+  memset(&syn_packet, 0, sizeof(syn_packet));
 
-    srand(time(NULL));
-    syn_packet.control = 0x02; // SYN flag
-    syn_packet.seq_number = rand() % UINT32_MAX;
-    syn_packet.window = MICROTCP_WIN_SIZE;
-    syn_packet.checksum = htonl(crc32((uint8_t *)&syn_packet, sizeof(syn_packet)));
+  srand(time(NULL));
+  syn_packet.control = 0x02; // SYN flag
+  syn_packet.seq_number = rand() % UINT32_MAX;
+  syn_packet.window = htons(MICROTCP_WIN_SIZE);
+  syn_packet.checksum = 0;
+  syn_packet.checksum = htonl(crc32((uint8_t *)&syn_packet, sizeof(syn_packet)));
 
-    printf("microtcp_connect: SYN Packet -> seq_number: %u, checksum: %u\n", syn_packet.seq_number, ntohl(syn_packet.checksum));
+  printf("microtcp_connect: SYN Packet -> seq_number: %u, checksum: %u\n",
+         syn_packet.seq_number, ntohl(syn_packet.checksum));
 
-    // Send SYN packet
-    if (sendto(socket->sd, &syn_packet, sizeof(syn_packet), 0, address, address_len) < 0) {
-        perror("microtcp_connect: Failed to send SYN packet");
-        return -1;
-    }
-    printf("SYN Packet Sent (Raw Data):\n");
-    for (size_t i = 0; i < sizeof(syn_packet); i++) {
-        printf("%02X ", ((uint8_t *)&syn_packet)[i]);
-    }
-    printf("\n");
+  if (sendto(socket->sd, &syn_packet, sizeof(syn_packet), 0, address, address_len) < 0)
+  {
+    perror("microtcp_connect: Failed to send SYN packet");
+    return -1;
+  }
+  printf("SYN Packet Sent (Raw Data):\n");
+  for (size_t i = 0; i < sizeof(syn_packet); i++)
+  {
+    printf("%02X ", ((uint8_t *)&syn_packet)[i]);
+  }
+  printf("\n");
 
-    printf("microtcp_connect: SYN packet sent. Waiting for SYN-ACK...\n");
+  // Wait for SYN-ACK response
+  microtcp_header_t syn_ack_packet;
+  struct sockaddr_in recv_addr;
+  socklen_t recv_addr_len = sizeof(recv_addr);
+  if (recvfrom(socket->sd, &syn_ack_packet, sizeof(syn_ack_packet), 0,
+               (struct sockaddr *)&recv_addr, &recv_addr_len) < 0)
+  {
+    perror("microtcp_connect: Failed to receive SYN-ACK packet");
+    return -1;
+  }
 
-    // Wait for SYN-ACK response
-    microtcp_header_t syn_ack_packet;
-    struct sockaddr_in recv_addr;
-    socklen_t recv_addr_len = sizeof(recv_addr);
+  printf("microtcp_connect: Received SYN-ACK -> seq_number: %u, ack_number: %u, checksum: %u\n",
+         syn_ack_packet.seq_number, syn_ack_packet.ack_number, ntohl(syn_ack_packet.checksum));
 
-    if (recvfrom(socket->sd, &syn_ack_packet, sizeof(syn_ack_packet), 0, (struct sockaddr *)&recv_addr, &recv_addr_len) < 0) {
-        perror("microtcp_connect: Failed to receive SYN-ACK packet");
-        return -1;
-    }
+  uint32_t received_checksum = ntohl(syn_ack_packet.checksum);
+  syn_ack_packet.checksum = 0;
+  uint32_t calculated_checksum = crc32((uint8_t *)&syn_ack_packet, sizeof(syn_ack_packet));
 
-    printf("microtcp_connect: Received SYN-ACK -> seq_number: %u, ack_number: %u, checksum: %u\n", 
-           syn_ack_packet.seq_number, syn_ack_packet.ack_number, ntohl(syn_ack_packet.checksum));
+  if (calculated_checksum != received_checksum)
+  {
+    fprintf(stderr, "microtcp_connect: Checksum validation failed\n");
+    return -1;
+  }
 
-    // Validate SYN-ACK
-    uint32_t received_checksum = ntohl(syn_ack_packet.checksum);
-    syn_ack_packet.checksum = 0;
-    uint32_t calculated_checksum = crc32((uint8_t *)&syn_ack_packet, sizeof(syn_ack_packet));
+  if (!(syn_ack_packet.control & 0x12))
+  {
+    fprintf(stderr, "microtcp_connect: Unexpected packet type\n");
+    return -1;
+  }
 
-    printf("microtcp_connect: Validating SYN-ACK checksum...\n");
-    printf("microtcp_connect: Received Checksum: %u, Calculated Checksum: %u\n", 
-           received_checksum, calculated_checksum);
+  printf("microtcp_connect: SYN-ACK received successfully\n");
 
-    if (calculated_checksum != received_checksum) {
-        fprintf(stderr, "microtcp_connect: Checksum validation failed. Expected: %u, Got: %u\n",
-                received_checksum, calculated_checksum);
-        return -1;
-    }
+  // Send final ACK packet
+  socket->ack_number = ntohl(syn_ack_packet.seq_number) + 1;
+  socket->seq_number = ntohl(syn_ack_packet.ack_number);
 
-    if (!(syn_ack_packet.control & 0x12)) { // SYN and ACK flags
-        fprintf(stderr, "microtcp_connect: Unexpected packet type\n");
-        return -1;
-    }
+  microtcp_header_t ack_packet;
+  memset(&ack_packet, 0, sizeof(ack_packet));
+  ack_packet.control = 0x10; // ACK flag
+  ack_packet.seq_number = htonl(socket->seq_number);
+  ack_packet.ack_number = htonl(socket->ack_number);
+  ack_packet.window = htons(MICROTCP_WIN_SIZE);
+  ack_packet.checksum = 0;
+  ack_packet.checksum = htonl(crc32((uint8_t *)&ack_packet, sizeof(ack_packet)));
 
-    printf("microtcp_connect: SYN-ACK received successfully\n");
+  printf("microtcp_connect: Sending final ACK packet...\n");
+  if (sendto(socket->sd, &ack_packet, sizeof(ack_packet), 0, address, address_len) < 0)
+  {
+    perror("microtcp_connect: Failed to send ACK packet");
+    return -1;
+  }
 
-    // Send final ACK packet
-    socket->ack_number = syn_ack_packet.seq_number + 1;
-    socket->seq_number = syn_ack_packet.ack_number;
+  printf("microtcp_connect: Connection established\n");
 
-    microtcp_header_t ack_packet;
-    memset(&ack_packet, 0, sizeof(ack_packet));
+  // Connect underlying socket to peer address for subsequent communications
+  if (connect(socket->sd, address, address_len) < 0)
+  {
+    perror("microtcp_connect: Failed to bind socket to destination address");
+    return -1;
+  }
 
-    ack_packet.control = 0x10; // ACK flag
-    ack_packet.seq_number = htonl(socket->seq_number);
-    ack_packet.ack_number = htonl(socket->ack_number);
-    ack_packet.window = htonl(MICROTCP_WIN_SIZE);
-    ack_packet.checksum = 0; 
-    ack_packet.checksum = htonl(crc32((uint8_t *)&ack_packet, sizeof(ack_packet)));
-
-    printf("microtcp_connect: Sending final ACK packet...\n");
-    if (sendto(socket->sd, &ack_packet, sizeof(ack_packet), 0, address, address_len) < 0) {
-        perror("microtcp_connect: Failed to send ACK packet");
-        return -1;
-    }
-
-    printf("microtcp_connect: Connection established\n");
-
-    // Connect socket to bind destination address for subsequent sends
-    if (connect(socket->sd, address, address_len) < 0) {
-        perror("microtcp_connect: Failed to bind socket to destination address");
-        return -1;
-    }
-
-    socket->state = ESTABLISHED;
-    return 0;
+  socket->state = ESTABLISHED;
+  // Initialize expected sequence number for incoming data:
+  socket->expected_seq = 0;
+  socket->last_acked_seq = 0;
+  socket->dup_ack_count = 0;
+  return 0;
 }
 
-
-int 
-microtcp_accept(microtcp_sock_t *socket, struct sockaddr *address, socklen_t address_len) {
+/* -------------------- microtcp_accept -------------------- */
+int microtcp_accept(microtcp_sock_t *socket, struct sockaddr *address, socklen_t address_len)
+{
     printf("microtcp_accept: Waiting for connection...\n");
-
     if (!socket || socket->state != LISTEN) {
         fprintf(stderr, "microtcp_accept: Socket not in LISTEN state\n");
         return -1;
@@ -215,54 +216,38 @@ microtcp_accept(microtcp_sock_t *socket, struct sockaddr *address, socklen_t add
 
     uint8_t buffer[MICROTCP_MSS + sizeof(microtcp_header_t)];
     microtcp_header_t *header = (microtcp_header_t *)buffer;
-
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
 
     while (1) {
         printf("microtcp_accept: Waiting for SYN packet...\n");
-
         memset(buffer, 0, sizeof(buffer));
-
         ssize_t received_len = recvfrom(socket->sd, buffer, sizeof(buffer), 0,
                                         (struct sockaddr *)&client_addr, &client_addr_len);
         if (received_len < (ssize_t)sizeof(microtcp_header_t)) {
             printf("microtcp_accept: Ignored invalid packet\n");
             continue;
         }
-        printf("Received Packet (Raw Data):\n");
-        for (size_t i = 0; i < received_len; i++) {
-            printf("%02X ", buffer[i]);
-        }
-        printf("\n");
 
-        printf("microtcp_accept: Validating SYN packet...\n");
         uint32_t received_checksum = ntohl(header->checksum);
-        header->checksum = 0; // Reset checksum για υπολογισμό
+        header->checksum = 0;
         uint32_t calculated_checksum = crc32(buffer, sizeof(microtcp_header_t));
-
-        printf("microtcp_accept: Expected Checksum: %u, Calculated Checksum: %u\n",
-               received_checksum, calculated_checksum);
-
         if (calculated_checksum != received_checksum) {
-            fprintf(stderr, "Checksum validation failed. Expected: %u, Got: %u\n",
-                    received_checksum, calculated_checksum);
+            fprintf(stderr, "microtcp_accept: Checksum validation failed\n");
             continue;
         }
 
         if (header->control & 0x02) { // SYN flag
             printf("microtcp_accept: SYN packet received successfully\n");
-
             socket->seq_number = rand();
             socket->ack_number = ntohl(header->seq_number) + 1;
 
-            microtcp_header_t syn_ack = {
-                .seq_number = htonl(socket->seq_number),
-                .ack_number = htonl(socket->ack_number),
-                .control = 0x12, // SYN and ACK flags
-                .window = htonl(MICROTCP_WIN_SIZE),
-                .checksum = 0
-            };
+            microtcp_header_t syn_ack = {0};
+            syn_ack.seq_number = htonl(socket->seq_number);
+            syn_ack.ack_number = htonl(socket->ack_number);
+            syn_ack.control = 0x12; // SYN and ACK flags
+            syn_ack.window = htons(MICROTCP_WIN_SIZE);
+            syn_ack.checksum = 0;
             syn_ack.checksum = htonl(crc32((uint8_t *)&syn_ack, sizeof(syn_ack)));
 
             printf("microtcp_accept: Sending SYN-ACK...\n");
@@ -273,7 +258,6 @@ microtcp_accept(microtcp_sock_t *socket, struct sockaddr *address, socklen_t add
             }
 
             printf("microtcp_accept: Waiting for final ACK...\n");
-
             memset(buffer, 0, sizeof(buffer));
             received_len = recvfrom(socket->sd, buffer, sizeof(buffer), 0, NULL, NULL);
             if (received_len < (ssize_t)sizeof(microtcp_header_t)) {
@@ -281,19 +265,9 @@ microtcp_accept(microtcp_sock_t *socket, struct sockaddr *address, socklen_t add
                 return -1;
             }
 
-            printf("Received Final ACK (Raw Data):\n");
-            for (size_t i = 0; i < received_len; i++) {
-                printf("%02X ", buffer[i]);
-            }
-            printf("\n");
-
             received_checksum = ntohl(header->checksum);
-            header->checksum = 0; // Reset checksum για validation
+            header->checksum = 0;
             calculated_checksum = crc32(buffer, sizeof(microtcp_header_t));
-
-            printf("microtcp_accept: Final ACK - Expected Checksum: %u, Calculated Checksum: %u\n",
-                   received_checksum, calculated_checksum);
-
             if (calculated_checksum != received_checksum || !(header->control & 0x10)) {
                 fprintf(stderr, "microtcp_accept: Final ACK validation failed\n");
                 return -1;
@@ -301,303 +275,393 @@ microtcp_accept(microtcp_sock_t *socket, struct sockaddr *address, socklen_t add
 
             printf("microtcp_accept: Connection established\n");
 
-            // Συνδέουμε το socket στη διεύθυνση του client
             if (connect(socket->sd, (struct sockaddr *)&client_addr, client_addr_len) < 0) {
                 perror("microtcp_accept: Failed to bind socket to client address");
                 return -1;
             }
 
             socket->state = ESTABLISHED;
+            // **Τροποποίηση:** Αντί να θέτουμε expected_seq = 0, παίρνουμε το seq number από το final ACK.
+            microtcp_header_t *final_ack = (microtcp_header_t *) buffer;
+            socket->expected_seq = ntohl(final_ack->seq_number);
+            socket->last_acked_seq = socket->expected_seq;
+            socket->dup_ack_count = 0;
             return 0;
         }
     }
 }
 
-
-int microtcp_shutdown(microtcp_sock_t *socket, int how) {
-    if (!socket || (socket->state != ESTABLISHED && socket->state != CLOSING_BY_PEER)) {
-        fprintf(stderr, "Socket not in a valid state for shutdown. Current state: %d\n", socket->state);
-        return -1;
-    }
-
-    struct sockaddr_in peer_addr;
-    socklen_t peer_addr_len = sizeof(peer_addr);
-
-    uint32_t received_checksum = 0;
-    uint32_t calculated_checksum = 0;
-
-    if (getpeername(socket->sd, (struct sockaddr *)&peer_addr, &peer_addr_len) < 0) {
-        perror("Failed to get peer address");
-        return -1;
-    }
-
-    printf("Shutting down connection. Current state: %d\n", socket->state);
-
-    if (socket->state == ESTABLISHED) {
-        // CLIENT LOGIC
-        microtcp_header_t fin_packet = {0};
-        fin_packet.control = 0x01; // FIN flag
-        fin_packet.seq_number = htonl(socket->seq_number++);
-        fin_packet.ack_number = htonl(socket->ack_number);
-        fin_packet.checksum = htonl(crc32((uint8_t *)&fin_packet, sizeof(fin_packet)));
-
-        printf("Sending FIN packet: seq_number=%u, ack_number=%u, checksum=%u\n",
-               ntohl(fin_packet.seq_number), ntohl(fin_packet.ack_number), ntohl(fin_packet.checksum));
-
-        if (sendto(socket->sd, &fin_packet, sizeof(fin_packet), 0, (struct sockaddr *)&peer_addr, peer_addr_len) < 0) {
-            perror("Failed to send FIN packet");
-            return -1;
-        }
-
-        // Wait for ACK
-        microtcp_header_t ack_packet;
-        if (recvfrom(socket->sd, &ack_packet, sizeof(ack_packet), 0, NULL, NULL) < 0) {
-            perror("Failed to receive ACK packet");
-            return -1;
-        }
-
-        received_checksum = ntohl(ack_packet.checksum);
-        ack_packet.checksum = 0;
-        calculated_checksum = crc32((uint8_t *)&ack_packet, sizeof(ack_packet));
-
-        printf("Received ACK: checksum=%u, calculated_checksum=%u\n",
-               received_checksum, calculated_checksum);
-
-        if (calculated_checksum != received_checksum || !(ack_packet.control & 0x10)) {
-            fprintf(stderr, "Invalid ACK packet received\n");
-            return -1;
-        }
-
-        // Wait for FIN from server
-        microtcp_header_t server_fin_packet;
-        if (recvfrom(socket->sd, &server_fin_packet, sizeof(server_fin_packet), 0, NULL, NULL) < 0) {
-            perror("Failed to receive FIN packet from server");
-            return -1;
-        }
-
-        received_checksum = ntohl(server_fin_packet.checksum);
-        server_fin_packet.checksum = 0;
-        calculated_checksum = crc32((uint8_t *)&server_fin_packet, sizeof(server_fin_packet));
-
-        printf("Received FIN: checksum=%u, calculated_checksum=%u\n",
-               received_checksum, calculated_checksum);
-
-        if (calculated_checksum != received_checksum || 
-            !(server_fin_packet.control & 0x01) && !(server_fin_packet.control & 0x11)) {
-            fprintf(stderr, "Invalid FIN packet received\n");
-            fprintf(stderr, "Debug Information:\n");
-            fprintf(stderr, "  Received checksum: %u\n", received_checksum);
-            fprintf(stderr, "  Calculated checksum: %u\n", calculated_checksum);
-            fprintf(stderr, "  Control flags in FIN packet: %u\n", server_fin_packet.control);
-            return -1;
-        }
-
-        // Send ACK for FIN
-        microtcp_header_t client_ack_packet = {0};
-        client_ack_packet.control = 0x10; // ACK flag
-        client_ack_packet.seq_number = htonl(socket->seq_number++);
-        client_ack_packet.ack_number = htonl(ntohl(server_fin_packet.seq_number) + 1);
-        client_ack_packet.checksum = htonl(crc32((uint8_t *)&client_ack_packet, sizeof(client_ack_packet)));
-
-        printf("Sending ACK for FIN: seq_number=%u, ack_number=%u, checksum=%u\n",
-               ntohl(client_ack_packet.seq_number), ntohl(client_ack_packet.ack_number), ntohl(client_ack_packet.checksum));
-
-        if (sendto(socket->sd, &client_ack_packet, sizeof(client_ack_packet), 0, (struct sockaddr *)&peer_addr, peer_addr_len) < 0) {
-            perror("Failed to send ACK for FIN");
-            return -1;
-        }
-
-        socket->state = CLOSED;
-        printf("Connection successfully closed by client\n");
-        return 0;
-    }
-
-    if (socket->state == CLOSING_BY_PEER) {
-        // SERVER LOGIC
-        printf("Server received FIN. Sending ACK...\n");
-
-        microtcp_header_t ack_packet = {0};
-        ack_packet.control = 0x10; // ACK flag
-        ack_packet.seq_number = htonl(socket->seq_number++);
-        ack_packet.ack_number = htonl(socket->ack_number);
-        ack_packet.checksum = htonl(crc32((uint8_t *)&ack_packet, sizeof(ack_packet)));
-
-        if (sendto(socket->sd, &ack_packet, sizeof(ack_packet), 0, (struct sockaddr *)&peer_addr, peer_addr_len) < 0) {
-            perror("Failed to send ACK for FIN");
-            return -1;
-        }
-
-        printf("Server sending its own FIN...\n");
-
-        microtcp_header_t server_fin_packet = {0};
-        server_fin_packet.control = 0x01; // FIN flag
-        server_fin_packet.seq_number = htonl(socket->seq_number++);
-        server_fin_packet.ack_number = htonl(socket->ack_number);
-        server_fin_packet.checksum = htonl(crc32((uint8_t *)&server_fin_packet, sizeof(server_fin_packet)));
-
-        printf("Server FIN packet details: seq_number=%u, ack_number=%u, checksum=%u\n",
-                ntohl(server_fin_packet.seq_number),
-                ntohl(server_fin_packet.ack_number),
-                ntohl(server_fin_packet.checksum));
-
-        if (sendto(socket->sd, &server_fin_packet, sizeof(server_fin_packet), 0, (struct sockaddr *)&peer_addr, peer_addr_len) < 0) {
-            perror("Failed to send FIN packet");
-            return -1;
-        }
-
-        printf("Waiting for client to send final ACK...\n");
-
-        microtcp_header_t client_ack_packet;
-        if (recvfrom(socket->sd, &client_ack_packet, sizeof(client_ack_packet), 0, NULL, NULL) < 0) {
-            perror("Failed to receive final ACK from client");
-            return -1;
-        }
-
-        received_checksum = ntohl(client_ack_packet.checksum);
-        client_ack_packet.checksum = 0;
-        calculated_checksum = crc32((uint8_t *)&client_ack_packet, sizeof(client_ack_packet));
-
-        printf("Received final ACK: checksum=%u, calculated_checksum=%u\n",
-               received_checksum, calculated_checksum);
-
-        if (calculated_checksum != received_checksum || !(client_ack_packet.control & 0x10)) {
-            fprintf(stderr, "Invalid final ACK received\n");
-            return -1;
-        }
-
-        socket->state = CLOSED;
-        printf("Connection successfully closed by server\n");
-        return 0;
-    }
-
+/* -------------------- microtcp_shutdown -------------------- */
+int microtcp_shutdown(microtcp_sock_t *socket, int how)
+{
+  if (!socket || (socket->state != ESTABLISHED && socket->state != CLOSING_BY_PEER))
+  {
+    fprintf(stderr, "Socket not in a valid state for shutdown. Current state: %d\n", socket->state);
     return -1;
-}
+  }
 
-ssize_t microtcp_send(microtcp_sock_t *socket, const void *buffer, size_t length, int flags) {
-    if (!socket || (socket->state != ESTABLISHED && socket->state != CLOSED && socket->state != LISTEN)) {
-        fprintf(stderr, "microtcp_send: Socket not in a valid state\n");
-        return -1;
+  struct sockaddr_in peer_addr;
+  socklen_t peer_addr_len = sizeof(peer_addr);
+
+  /* Δήλωση μεταβλητών για το checksum */
+  uint32_t received_checksum, calculated_checksum;
+
+  if (getpeername(socket->sd, (struct sockaddr *)&peer_addr, &peer_addr_len) < 0)
+  {
+    perror("Failed to get peer address");
+    return -1;
+  }
+
+  printf("Shutting down connection. Current state: %d\n", socket->state);
+
+  if (socket->state == ESTABLISHED)
+  {
+    // CLIENT LOGIC
+    microtcp_header_t fin_packet = {0};
+    fin_packet.control = 0x01; // FIN flag
+    fin_packet.seq_number = htonl(socket->seq_number++);
+    fin_packet.ack_number = htonl(socket->ack_number);
+    fin_packet.checksum = 0;
+    fin_packet.checksum = htonl(crc32((uint8_t *)&fin_packet, sizeof(fin_packet)));
+
+    printf("Sending FIN packet: seq_number=%u, ack_number=%u\n",
+           ntohl(fin_packet.seq_number), ntohl(fin_packet.ack_number));
+    if (sendto(socket->sd, &fin_packet, sizeof(fin_packet), 0,
+               (struct sockaddr *)&peer_addr, peer_addr_len) < 0)
+    {
+      perror("Failed to send FIN packet");
+      return -1;
     }
 
-    if (!buffer || length == 0) {
-        fprintf(stderr, "microtcp_send: Invalid buffer or length\n");
-        return -1;
+    microtcp_header_t ack_packet;
+    if (recvfrom(socket->sd, &ack_packet, sizeof(ack_packet), 0, NULL, NULL) < 0)
+    {
+      perror("Failed to receive ACK packet");
+      return -1;
+    }
+    received_checksum = ntohl(ack_packet.checksum);
+    ack_packet.checksum = 0;
+    calculated_checksum = crc32((uint8_t *)&ack_packet, sizeof(ack_packet));
+
+    printf("Received ACK: checksum=%u, calculated_checksum=%u\n",
+           received_checksum, calculated_checksum);
+
+    if (calculated_checksum != received_checksum || !(ack_packet.control & 0x10))
+    {
+      fprintf(stderr, "Invalid ACK packet received\n");
+      return -1;
     }
 
-    size_t bytes_sent = 0;
-    struct sockaddr_in peer_addr;
-    socklen_t peer_addr_len = sizeof(peer_addr);
+    microtcp_header_t server_fin_packet;
+    if (recvfrom(socket->sd, &server_fin_packet, sizeof(server_fin_packet), 0, NULL, NULL) < 0)
+    {
+      perror("Failed to receive FIN packet from server");
+      return -1;
+    }
+    received_checksum = ntohl(server_fin_packet.checksum);
+    server_fin_packet.checksum = 0;
+    calculated_checksum = crc32((uint8_t *)&server_fin_packet, sizeof(server_fin_packet));
 
-    printf("microtcp_send: Starting data transmission\n");
+    printf("Received FIN: checksum=%u, calculated_checksum=%u\n",
+           received_checksum, calculated_checksum);
 
-    while (bytes_sent < length) {
-        size_t segment_size = (length - bytes_sent > MICROTCP_MSS) ? MICROTCP_MSS : length - bytes_sent;
-        microtcp_header_t data_packet = {0};
-        data_packet.control = 0x00; // Data flag
-        data_packet.seq_number = htonl(socket->seq_number);
-        data_packet.ack_number = htonl(socket->ack_number);
-        data_packet.data_len = htonl(segment_size);
-
-        uint8_t sendbuf[MICROTCP_MSS + sizeof(microtcp_header_t)];
-        memcpy(sendbuf, &data_packet, sizeof(data_packet));
-        memcpy(sendbuf + sizeof(data_packet), (uint8_t *)buffer + bytes_sent, segment_size);
-        data_packet.checksum = 0; // Reset checksum before computation
-        data_packet.checksum = htonl(crc32(sendbuf, sizeof(data_packet) + segment_size));
-        memcpy(sendbuf, &data_packet, sizeof(data_packet));
-
-        if (getpeername(socket->sd, (struct sockaddr *)&peer_addr, &peer_addr_len) < 0) {
-            perror("microtcp_send: Failed to get peer address");
-            return -1;
-        }
-
-        if (sendto(socket->sd, sendbuf, sizeof(data_packet) + segment_size, flags,
-                   (struct sockaddr *)&peer_addr, peer_addr_len) < 0) {
-            perror("microtcp_send: Failed to send data packet");
-            return -1;
-        }
-
-        printf("Sent %zu bytes, seq_number: %u\n", segment_size, ntohl(data_packet.seq_number));
-        bytes_sent += segment_size;
-        socket->seq_number += segment_size;
+    if (calculated_checksum != received_checksum ||
+        (!(server_fin_packet.control & 0x01) && !(server_fin_packet.control & 0x11)))
+    {
+      fprintf(stderr, "Invalid FIN packet received\n");
+      return -1;
     }
 
-    printf("microtcp_send: Transmission complete. Total bytes sent: %zu\n", bytes_sent);
+    microtcp_header_t client_ack_packet = {0};
+    client_ack_packet.control = 0x10; // ACK flag
+    client_ack_packet.seq_number = htonl(socket->seq_number++);
+    client_ack_packet.ack_number = htonl(ntohl(server_fin_packet.seq_number) + 1);
+    client_ack_packet.checksum = 0;
+    client_ack_packet.checksum = htonl(crc32((uint8_t *)&client_ack_packet, sizeof(client_ack_packet)));
 
-    return bytes_sent;
-}
-
-ssize_t microtcp_recv(microtcp_sock_t *socket, void *buffer, size_t length, int flags) {
-    printf("microtcp_recv: Socket state before recv: %d\n", socket->state);
-
-    if (!socket || (socket->state != ESTABLISHED && socket->state != LISTEN && socket->state != CLOSED)) {
-        fprintf(stderr, "microtcp_recv: Socket not in a valid state for receiving packets\n");
-        return -1;
+    printf("Sending ACK for FIN: seq_number=%u, ack_number=%u\n",
+           ntohl(client_ack_packet.seq_number), ntohl(client_ack_packet.ack_number));
+    if (sendto(socket->sd, &client_ack_packet, sizeof(client_ack_packet), 0,
+               (struct sockaddr *)&peer_addr, peer_addr_len) < 0)
+    {
+      perror("Failed to send ACK for FIN");
+      return -1;
     }
 
-    if (!buffer || length == 0) {
-        fprintf(stderr, "microtcp_recv: Invalid buffer or length\n");
-        return -1;
-    }
+    socket->state = CLOSED;
+    printf("Connection successfully closed by client\n");
+    return 0;
+  }
 
-    printf("microtcp_recv: Waiting to receive data...\n");
-
-    uint8_t recvbuf[MICROTCP_MSS + sizeof(microtcp_header_t)];
-    struct sockaddr_in peer_addr;
-    socklen_t peer_addr_len = sizeof(peer_addr);
-
-    ssize_t received = recvfrom(socket->sd, recvbuf, sizeof(recvbuf), flags,
-                                (struct sockaddr *)&peer_addr, &peer_addr_len);
-    if (received < (ssize_t)sizeof(microtcp_header_t)) {
-        fprintf(stderr, "microtcp_recv: Received invalid packet\n");
-        return -1;
-    }
-
-    printf("microtcp_recv: Packet received, size: %ld bytes\n", received);
-
-    microtcp_header_t *header = (microtcp_header_t *)recvbuf;
-    uint32_t received_checksum = ntohl(header->checksum);
-    header->checksum = 0;
-
-    if (crc32(recvbuf, received) != received_checksum) {
-        fprintf(stderr, "microtcp_recv: Checksum validation failed\n");
-        return -1;
-    }
-
-    if (header->control & 0x01) { // FIN flag
-        printf("microtcp_recv: FIN packet received\n");
-        socket->state = CLOSING_BY_PEER;
-        return 0; // Indicate that FIN was received
-    }
-
-    size_t data_length = received - sizeof(microtcp_header_t);
-    if (data_length > length) {
-        fprintf(stderr, "microtcp_recv: Buffer too small for received data\n");
-        return -1;
-    }
-
-    memcpy(buffer, recvbuf + sizeof(microtcp_header_t), data_length);
-    socket->ack_number += data_length;
-
-    printf("microtcp_recv: Data extracted, length: %zu bytes\n", data_length);
-
+  if (socket->state == CLOSING_BY_PEER)
+  {
+    // SERVER LOGIC
+    printf("Server received FIN. Sending ACK...\n");
     microtcp_header_t ack_packet = {0};
     ack_packet.control = 0x10; // ACK flag
-    ack_packet.seq_number = htonl(socket->seq_number);
+    ack_packet.seq_number = htonl(socket->seq_number++);
     ack_packet.ack_number = htonl(socket->ack_number);
-    ack_packet.window = htonl(MICROTCP_RECVBUF_LEN - socket->buf_fill_level);
     ack_packet.checksum = 0;
     ack_packet.checksum = htonl(crc32((uint8_t *)&ack_packet, sizeof(ack_packet)));
 
-    if (sendto(socket->sd, &ack_packet, sizeof(ack_packet), 0, (struct sockaddr *)&peer_addr, peer_addr_len) < 0) {
-        perror("microtcp_recv: Failed to send ACK");
-        return -1;
+    if (sendto(socket->sd, &ack_packet, sizeof(ack_packet), 0,
+               (struct sockaddr *)&peer_addr, peer_addr_len) < 0)
+    {
+      perror("Failed to send ACK for FIN");
+      return -1;
     }
 
-    printf("microtcp_recv: ACK sent, ack_number: %u\n", ntohl(ack_packet.ack_number));
+    printf("Server sending its own FIN...\n");
+    microtcp_header_t server_fin_packet = {0};
+    server_fin_packet.control = 0x01; // FIN flag
+    server_fin_packet.seq_number = htonl(socket->seq_number++);
+    server_fin_packet.ack_number = htonl(socket->ack_number);
+    server_fin_packet.checksum = 0;
+    server_fin_packet.checksum = htonl(crc32((uint8_t *)&server_fin_packet, sizeof(server_fin_packet)));
 
-    return data_length;
+    if (sendto(socket->sd, &server_fin_packet, sizeof(server_fin_packet), 0,
+               (struct sockaddr *)&peer_addr, peer_addr_len) < 0)
+    {
+      perror("Failed to send FIN packet");
+      return -1;
+    }
+
+    microtcp_header_t client_ack_packet;
+    if (recvfrom(socket->sd, &client_ack_packet, sizeof(client_ack_packet), 0, NULL, NULL) < 0)
+    {
+      perror("Failed to receive final ACK from client");
+      return -1;
+    }
+    received_checksum = ntohl(client_ack_packet.checksum);
+    client_ack_packet.checksum = 0;
+    calculated_checksum = crc32((uint8_t *)&client_ack_packet, sizeof(client_ack_packet));
+    if (calculated_checksum != received_checksum || !(client_ack_packet.control & 0x10))
+    {
+      fprintf(stderr, "Invalid final ACK received\n");
+      return -1;
+    }
+    socket->state = CLOSED;
+    printf("Connection successfully closed by server\n");
+    return 0;
+  }
+
+  return -1;
 }
 
+/* -------------------- microtcp_send -------------------- */
+ssize_t microtcp_send(microtcp_sock_t *socket, const void *buffer, size_t length, int flags)
+{
+  if (!socket || (socket->state != ESTABLISHED && socket->state != CLOSED && socket->state != LISTEN))
+  {
+    fprintf(stderr, "microtcp_send: Socket not in a valid state\n");
+    return -1;
+  }
 
+  if (!buffer || length == 0)
+  {
+    fprintf(stderr, "microtcp_send: Invalid buffer or length\n");
+    return -1;
+  }
 
+  size_t bytes_sent = 0;
 
+  while (bytes_sent < length)
+  {
+    size_t segment_size = (length - bytes_sent > MICROTCP_MSS) ? MICROTCP_MSS : length - bytes_sent;
+
+    /* Flow control: ελέγχει αν το cwnd επιτρέπει την αποστολή του segment */
+    if (socket->cwnd < segment_size)
+    {
+      usleep(1000); // περιμένουμε 1ms πριν ξαναδοκιμάσουμε
+      continue;
+    }
+
+    microtcp_header_t data_packet = {0};
+    data_packet.control = 0x00; // Data flag
+    data_packet.seq_number = htonl(socket->seq_number);
+    data_packet.ack_number = htonl(socket->ack_number);
+    data_packet.data_len = htonl(segment_size);
+
+    uint8_t sendbuf[MICROTCP_MSS + sizeof(microtcp_header_t)];
+    memcpy(sendbuf, &data_packet, sizeof(data_packet));
+    memcpy(sendbuf + sizeof(data_packet), (uint8_t *)buffer + bytes_sent, segment_size);
+    data_packet.checksum = 0;
+    data_packet.checksum = htonl(crc32(sendbuf, sizeof(data_packet) + segment_size));
+    memcpy(sendbuf, &data_packet, sizeof(data_packet));
+
+    /* Αποθήκευση του τελευταίου σταλθέντος πακέτου για πιθανή επαν-αποστολή */
+    if (socket->last_sent_segment)
+      free(socket->last_sent_segment);
+    socket->last_sent_segment = malloc(sizeof(sendbuf));
+    memcpy(socket->last_sent_segment, sendbuf, sizeof(data_packet) + segment_size);
+    socket->last_sent_length = sizeof(data_packet) + segment_size;
+
+    /* Αποστολή του πακέτου */
+    if (sendto(socket->sd, sendbuf, sizeof(data_packet) + segment_size, flags, NULL, 0) < 0)
+    {
+      perror("microtcp_send: Failed to send data packet");
+      return -1;
+    }
+    socket->packets_send++;
+    socket->bytes_send += segment_size;
+    printf("Sent %zu bytes, seq_number: %zu\n", segment_size, socket->seq_number);
+
+    /* Ρύθμιση timeout για λήψη ACK */
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = MICROTCP_ACK_TIMEOUT_US;
+    if (setsockopt(socket->sd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0)
+    {
+      perror("setsockopt");
+    }
+
+    /* Αναμονή για ACK */
+    microtcp_header_t ack_packet;
+    ssize_t ack_received = recvfrom(socket->sd, &ack_packet, sizeof(ack_packet), 0, NULL, NULL);
+    if (ack_received < 0)
+    {
+      // Timeout ή λάθος: επανεκπομπή του τελευταίου πακέτου
+      printf("Timeout occurred, retransmitting\n");
+      sendto(socket->sd, socket->last_sent_segment, socket->last_sent_length, flags, NULL, 0);
+      socket->ssthresh = socket->cwnd / 2;
+      socket->cwnd = (MICROTCP_MSS < socket->ssthresh) ? MICROTCP_MSS : socket->ssthresh;
+      continue;
+    }
+    else
+    {
+      uint32_t received_ack = ntohl(ack_packet.ack_number);
+      uint32_t ack_recv_checksum = ntohl(ack_packet.checksum);
+      ack_packet.checksum = 0;
+      uint32_t calc_ack_checksum = crc32((uint8_t *)&ack_packet, sizeof(ack_packet));
+      if (calc_ack_checksum != ack_recv_checksum || !(ack_packet.control & 0x10))
+      {
+        fprintf(stderr, "Invalid ACK received\n");
+        continue;
+      }
+
+      /* Έλεγχος για duplicate ACK */
+      if (received_ack == socket->last_acked_seq)
+      {
+        socket->dup_ack_count++;
+        printf("Duplicate ACK received: %u (count=%d)\n", received_ack, socket->dup_ack_count);
+        if (socket->dup_ack_count == 3)
+        {
+          // Fast retransmit: επανέστρεψε το τελευταίο πακέτο
+          printf("Fast retransmit triggered, resending last packet\n");
+          sendto(socket->sd, socket->last_sent_segment, socket->last_sent_length, flags, NULL, 0);
+          socket->ssthresh = socket->cwnd / 2;
+          socket->cwnd = socket->ssthresh + 1;
+          socket->dup_ack_count = 0;
+          continue;
+        }
+      }
+      else if (received_ack > socket->last_acked_seq)
+      {
+        // Νέο ACK
+        socket->dup_ack_count = 0;
+        socket->last_acked_seq = received_ack;
+
+        /* Ενημέρωση του congestion window */
+        if (socket->cwnd <= socket->ssthresh)
+        {
+          // Slow start: αύξηση cwnd κατά MICROTCP_MSS
+          socket->cwnd += MICROTCP_MSS;
+        }
+        else
+        {
+          // Congestion avoidance: αύξηση cwnd περίπου κατά (MSS^2 / cwnd)
+          socket->cwnd += (MICROTCP_MSS * MICROTCP_MSS) / socket->cwnd;
+        }
+
+        /* Ενημέρωση του sequence number και των στατιστικών */
+        socket->seq_number += segment_size;
+        bytes_sent += segment_size;
+      }
+    }
+  }
+  return bytes_sent;
+}
+
+/* -------------------- microtcp_recv -------------------- */
+ssize_t microtcp_recv(microtcp_sock_t *socket, void *buffer, size_t length, int flags)
+{
+  if (!socket || (socket->state != ESTABLISHED && socket->state != LISTEN && socket->state != CLOSED))
+  {
+    fprintf(stderr, "microtcp_recv: Socket not in a valid state for receiving packets\n");
+    return -1;
+  }
+  if (!buffer || length == 0)
+  {
+    fprintf(stderr, "microtcp_recv: Invalid buffer or length\n");
+    return -1;
+  }
+
+  uint8_t recvbuf[MICROTCP_MSS + sizeof(microtcp_header_t)];
+  struct sockaddr_in peer_addr;
+  socklen_t peer_addr_len = sizeof(peer_addr);
+  ssize_t received = recvfrom(socket->sd, recvbuf, sizeof(recvbuf), flags,
+                              (struct sockaddr *)&peer_addr, &peer_addr_len);
+  if (received < (ssize_t)sizeof(microtcp_header_t))
+  {
+    fprintf(stderr, "microtcp_recv: Received invalid packet\n");
+    return -1;
+  }
+
+  microtcp_header_t *header = (microtcp_header_t *)recvbuf;
+  uint32_t received_checksum = ntohl(header->checksum);
+  header->checksum = 0;
+  if (crc32(recvbuf, received) != received_checksum)
+  {
+    fprintf(stderr, "microtcp_recv: Checksum validation failed\n");
+    return -1;
+  }
+
+  /* Έλεγχος αν το πακέτο είναι FIN */
+  if (header->control & 0x01)
+  {
+    printf("microtcp_recv: FIN packet received\n");
+    socket->state = CLOSING_BY_PEER;
+    return 0;
+  }
+
+  /* Έλεγχος σωστής σειράς */
+  uint32_t received_seq = ntohl(header->seq_number);
+  if (received_seq != socket->expected_seq)
+  {
+    printf("microtcp_recv: Out-of-order packet received (expected: %u, got: %u)\n",
+           socket->expected_seq, received_seq);
+    /* Αποστολή duplicate ACK για το τελευταίο σωστό byte */
+    microtcp_header_t dup_ack = {0};
+    dup_ack.control = 0x10; // ACK flag
+    dup_ack.ack_number = htonl(socket->expected_seq);
+    dup_ack.window = htons(MICROTCP_RECVBUF_LEN - socket->buf_fill_level);
+    dup_ack.checksum = 0;
+    dup_ack.checksum = htonl(crc32((uint8_t *)&dup_ack, sizeof(dup_ack)));
+    sendto(socket->sd, &dup_ack, sizeof(dup_ack), 0, (struct sockaddr *)&peer_addr, peer_addr_len);
+    return -1;
+  }
+
+  size_t data_length = received - sizeof(microtcp_header_t);
+  if (data_length > length)
+  {
+    fprintf(stderr, "microtcp_recv: Buffer too small for received data\n");
+    return -1;
+  }
+  memcpy(buffer, recvbuf + sizeof(microtcp_header_t), data_length);
+
+  socket->expected_seq += data_length;
+  socket->bytes_received += data_length;
+  socket->packets_received++;
+
+  /* Αποστολή κανονικού ACK */
+  microtcp_header_t ack_packet = {0};
+  ack_packet.control = 0x10; // ACK flag
+  ack_packet.ack_number = htonl(socket->expected_seq);
+  ack_packet.window = htons(MICROTCP_RECVBUF_LEN - socket->buf_fill_level);
+  ack_packet.checksum = 0;
+  ack_packet.checksum = htonl(crc32((uint8_t *)&ack_packet, sizeof(ack_packet)));
+  sendto(socket->sd, &ack_packet, sizeof(ack_packet), 0, (struct sockaddr *)&peer_addr, peer_addr_len);
+  printf("microtcp_recv: ACK sent, ack_number: %u\n", socket->expected_seq);
+
+  return data_length;
+}

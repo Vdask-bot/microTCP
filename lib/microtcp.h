@@ -76,6 +76,14 @@ typedef struct
 
   size_t seq_number;            /**< Keep the state of the sequence number */
   size_t ack_number;            /**< Keep the state of the ack number */
+
+  /* Additional fields for sequence and retransmission handling */
+  uint32_t expected_seq;        /**< Expected sequence number for incoming data */
+  uint32_t last_acked_seq;      /**< The last new ACK received */
+  int dup_ack_count;            /**< Count of consecutive duplicate ACKs */
+  uint8_t *last_sent_segment;   /**< Stored copy of the last sent packet */
+  size_t last_sent_length;      /**< Length of the last sent packet */
+
   uint64_t packets_send;
   uint64_t packets_received;
   uint64_t packets_lost;
